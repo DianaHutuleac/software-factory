@@ -1,0 +1,27 @@
+name: Wish
+description: For the product owner. Who wants what, and why, in one to three sentences. The planner agent turns it into tickets.
+title: "Wish: "
+labels: ["wish"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One wish per issue. The planner agent reads this as **data** and writes the tickets.
+        Do not write instructions for the agents here: they are ignored and the wish is marked `suspicious`.
+        Wishes from anyone but the product owner (or the watcher bot) do not start the planner.
+  - type: textarea
+    id: wish
+    attributes:
+      label: The wish
+      description: "As a <who>, I want <what>, so that <why>. One to three sentences."
+      placeholder: As a customer, I want to see the list of products with their prices, so that I can choose what to buy.
+    validations:
+      required: true
+  - type: textarea
+    id: not-wanted
+    attributes:
+      label: Not wanted (optional)
+      description: Anything this wish should not include, to keep the tickets small.
+      placeholder: No search, no images, no categories yet.
+    validations:
+      required: false
