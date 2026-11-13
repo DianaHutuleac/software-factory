@@ -1,0 +1,193 @@
+# ci: the single required check on `main` (harness item 2).
+#
+# Five independent jobs, then one job named `ci` that is green only if all five are green.
+# The ruleset on `main` requires the check `ci`, and nothing else.
+#
+# This workflow runs the pull request's own code, so it gets no secrets and a read-only token.
+# It uses `pull_request`, never `pull_request_target`: on a pull request from a fork GitHub
+# gives it no secrets at all, and the run waits for a maintainer's approval.
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+
+# No job gets any permission unless it asks for it below.
+permissions: {}
+
+# A new push to the pull request cancels the run for the previous commit.
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  paths:
+    name: protected paths
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read # check out the pull request to list the files it changes
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2 # the merge commit and its two parents: main, and the pull request
+          persist-credentials: false # do not leave the job token in .git/config
+      - name: Fail if an agent's pull request changes the harness
+        env:
+          # Paths no agent may change. The same list is in writer.yml.
+          #   .github/              workflows, agent prompts, issue forms
+          #   .claude/, .mcp.json   Claude Code settings, hooks and MCP servers
+          #   CLAUDE.md             the agents' rules, in any folder
+          #   CODEOWNERS, scripts/kill-switch.sh, docs/human-log.md
+          PROTECTED: '^\.github/|^\.claude/|^\.mcp\.json$|(^|/)CLAUDE(\.local)?\.md$|^CODEOWNERS$|^scripts/kill-switch\.sh$|^docs/human-log\.md$'
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          # Repository variable: a JSON array with the logins of the people who may open a
+          # harness pull request, for example ["DianaHutuleac","pseudocod"]. Agents are never
+          # on it. Unset means an empty list: the check fails for everyone.
+          HARNESS_AUTHORS: ${{ vars.HARNESS_AUTHORS }}
+        run: |
+          set -euo pipefail
+          # HEAD is the merge commit; HEAD^1 is main. --no-renames lists both the old and the
+          # new name of a moved file, so a protected file cannot be moved away unnoticed.
+          touched=$(git diff --name-only --no-renames HEAD^1 HEAD | grep -E "$PROTECTED" || true)
+          if [ -z "$touched" ]; then
+            echo "No protected path is changed."
+            exit 0
+          fi
+          echo "Protected paths changed by this pull request:"
+          echo "$touched"
+          if jq -e --arg a "$AUTHOR" 'index($a) != null' <<<"${HARNESS_AUTHORS:-[]}" >/dev/null 2>&1; then
+            echo "::notice::Harness change by $AUTHOR, a person on HARNESS_AUTHORS. The ruleset still requires a code owner's review."
+            exit 0
+          fi
+          echo "::error::$AUTHOR may not change protected paths. A person opens a separate harness pull request."
+          exit 1
+
+  secrets:
+    name: secrets scan (gitleaks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # check out the pull request with its history
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full history, so every commit of the pull request can be scanned
+          persist-credentials: false # do not leave the job token in .git/config
+      - name: Scan every commit of the pull request
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        # The image is pinned by digest (gitleaks v8.30.1). The repository is mounted read-only.
+        # Every commit is scanned, not only the last one: a key that was added and then removed
+        # is still public in the history. --redact keeps a found secret out of this public log.
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo:ro" \
+            ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git /repo --log-opts="${BASE_SHA}..${HEAD_SHA}" --redact --no-banner --exit-code 1
+
+  semgrep:
+    name: static analysis (Semgrep)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read # check out the pull request
+    container:
+      # Pinned by digest (semgrep 1.185.0).
+      image: semgrep/semgrep@sha256:67518c174185a2043fdbed16c70631b79209499b3671178e7194379b48295a0d
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # do not leave the job token in .git/config
+      # --error: any finding fails the job. --metrics=off: nothing about the code is sent to
+      # Semgrep. The rules (p/default) are downloaded from the Semgrep registry at run time.
+      - run: semgrep scan --config p/default --error --metrics=off
+
+  lockfile:
+    name: pinned dependencies
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # check out the pull request
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # do not leave the job token in .git/config
+      - name: Every action is pinned by commit SHA, every image by digest
+        run: |
+          set -euo pipefail
+          fail=0
+          # `uses:` must end in @<40 hex characters>. Local paths (./...) are this repository.
+          if grep -rnE '^\s*-?\s*uses:' .github/workflows | grep -vE 'uses:\s*\./' | grep -vE '@[0-9a-f]{40}(\s|$)'; then
+            echo "::error::The lines above use an action that is not pinned by commit SHA."
+            fail=1
+          fi
+          # Container images in workflows must carry a digest.
+          if grep -rnE '^\s*(image|container):\s*\S' .github/workflows | grep -vE '@sha256:[0-9a-f]{64}'; then
+            echo "::error::The lines above use a container image that is not pinned by digest."
+            fail=1
+          fi
+          # Base images in the Dockerfile must carry a digest (or be an earlier build stage).
+          if [ -f Dockerfile ]; then
+            stages=$(grep -iE '^FROM .+ AS ' Dockerfile | awk '{print $NF}' | paste -sd'|' -)
+            if grep -inE '^FROM ' Dockerfile | grep -vE '@sha256:[0-9a-f]{64}' \
+              | grep -viE "FROM (scratch|${stages:-scratch})( |$)"; then
+              echo "::error::The lines above use a base image that is not pinned by digest."
+              fail=1
+            fi
+          fi
+          exit "$fail"
+      - name: The lockfile matches the manifest
+        # STACK (session 4): replace this step with the stack's frozen-lockfile install, the
+        # command that fails when the lockfile and the manifest disagree (for example
+        # `npm ci`, `composer install` after `composer validate --strict`, `mvn` with a
+        # lockfile plugin). Until an app exists there is nothing to check; once a Dockerfile
+        # exists and this step is still a placeholder, it fails.
+        run: |
+          if [ ! -f Dockerfile ]; then
+            echo "::notice::No app yet (session 4). No lockfile to check."
+            exit 0
+          fi
+          echo "::error::An app exists but ci.yml has no frozen-lockfile command yet."
+          exit 1
+
+  tests:
+    name: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read # check out the pull request
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # do not leave the job token in .git/config
+      - name: Run the test suite
+        # STACK (session 4): replace this step with the toolchain setup (action pinned by SHA,
+        # exact version), the frozen-lockfile install and the test command. The commands stay
+        # here, in a protected file, and not in a script an agent could edit. Until an app
+        # exists there is nothing to test; once a Dockerfile exists and this step is still a
+        # placeholder, it fails.
+        run: |
+          if [ ! -f Dockerfile ]; then
+            echo "::notice::No app yet (session 4). No tests to run."
+            exit 0
+          fi
+          echo "::error::An app exists but ci.yml has no test command yet."
+          exit 1
+
+  ci:
+    # The one check the ruleset requires. always(): it also runs, and fails, when a job above
+    # failed or was cancelled. A skipped required check would otherwise count as passed.
+    name: ci
+    if: always()
+    needs: [paths, secrets, semgrep, lockfile, tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {} # reads the results of the jobs above; needs nothing from the repository
+    steps:
+      - name: All five jobs succeeded
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "$RESULTS"
+          jq -e 'length == 5 and all(. == "success")' <<<"$RESULTS" >/dev/null
