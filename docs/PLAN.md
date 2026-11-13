@@ -21,7 +21,7 @@ This file is the source for that page. Everything here is something either of us
 For each: the mechanism (setting, file or command), what the M1 video shows, and the risk it stops.
 
 ### 1. Least privilege (must have)
-- **Mechanism:** every workflow starts with `permissions: {}` and each job adds only what it needs (for example `contents: read`, `issues: write`). One GitHub App per agent (`factory-planner`, `factory-writer`, `factory-reviewer`), installed on this repo only, each with the smallest permission set for its stage. The Claude API key is passed only to the steps that call Claude. The Render deploy hook is an **environment secret** of `production`, so no agent job can even read it. The ruleset on `main` (item 2) applies to apps and admins alike.
+- **Mechanism:** every workflow starts with `permissions: {}` and each job adds only what it needs (for example `contents: read`, `issues: write`). One GitHub App per agent (`factory-planner`, `factory-writer`, `factory-reviewer`), installed on this repo only, each with the smallest permission set for its stage. Each agent workflow has two jobs: one runs Claude and has no GitHub write access (its output is a JSON object, and for the writer a patch file); the other has no Claude in it and does the GitHub writes with the agent's app token. The Claude API key is the only secret of the environment `factory-think`, the three app keys are the secrets of `factory-act`, and both environments can be used only by runs from `main`. The Claude API key is passed only to the steps that call Claude. The Render deploy hook is an **environment secret** of `production`, so no agent job can even read it. The ruleset on `main` (item 2) applies to apps and admins alike.
 - **Video:** the `permissions:` block of the writer job; the three apps' permission pages; a push to `main` with the writer's token being refused.
 - **Risk stopped:** a hijacked agent (for example through a ticket with a hidden instruction) pushing to `main`, reading the deploy hook, or acting outside this repo.
 
@@ -46,7 +46,7 @@ For each: the mechanism (setting, file or command), what the M1 video shows, and
 - **Risk stopped:** a key in a commit, a log line or a prompt that anyone can read in a public repo.
 
 ### 6. Audit log (must have)
-- **Mechanism:** every agent job ends with a step that writes one record in two places: a comment on the ticket, and a JSON line uploaded as a run artifact. Fields: agent, model, action, PR or commit, time, ticket number, run URL, tokens and cost (from the action's execution output). The run itself stays in the Actions log. Human actions go in `docs/human-log.md`.
+- **Mechanism:** every agent workflow ends with an `audit` job (`if: always()`, the reusable workflow `audit.yml`) that writes one record in two places: a comment on the ticket, and a JSON line uploaded as a run artifact. Fields: agent, model, action, PR or commit, time, ticket number, run URL, tokens and cost (from the action's execution output). The run itself stays in the Actions log. Human actions go in `docs/human-log.md`.
 - **Video:** the M1 ticket with its comments from planner, writer and reviewer, and one JSON artifact opened.
 - **Risk stopped:** not being able to answer "who did what, when, for which ticket". This is the proof the course asks for.
 
@@ -70,9 +70,9 @@ Only two doors start agents: a `wish` issue from the product owner (or the watch
 |---|---|---|---|
 | 1 | Vlad | Opens a Wish issue with the form. Label `wish` is added by the form. | **Human: product owner wish** (not one of the three decisions). Logged. |
 | 2 | Planner (Sonnet) | Starts on the `wish` label if the author is on the allow-list. Reads the wish as data. Writes one or more `ticket` issues from the template, links them to the wish, adds `needs-threat-model` where accounts, roles, personal data or payments are touched, adds `suspicious` and stops if the wish tries to instruct the agents. Writes its audit record. | No |
-| 3 | Writer (Sonnet) | Starts only if the ticket's author is the planner app. Creates branch `ticket-<n>`, writes a failing test, then the code, runs the tests, opens a PR with the `factory-writer` app token so other workflows run on it. Turns on auto-merge. Writes its audit record. | No |
-| 4 | `ci` | Tests, Semgrep, gitleaks, frozen-lockfile check, protected-path check (fails if the PR touches `.github/workflows/`, `CLAUDE.md`, `scripts/kill-switch.sh`). | No |
-| 5 | Reviewer (Opus) | A separate job, fresh context, `factory-reviewer` app. Reads only the ticket and the diff. Checks the acceptance criteria and `CLAUDE.md`. Approves or requests changes with a comment. Writes its audit record. | No |
+| 3 | Writer (Sonnet) | Starts only if the ticket's author is the planner app. Writes a failing test, then the code, runs the tests. A second job, without Claude, puts the change on branch `ticket-<n>` and opens a PR with the `factory-writer` app token so other workflows run on it. Turns on auto-merge. Writes its audit record. | No |
+| 4 | `ci` | Tests, Semgrep, gitleaks, frozen-lockfile and pin check, protected-path check (fails if an agent's PR touches `.github/`, `.claude/`, `.mcp.json`, `CLAUDE.md`, `CODEOWNERS`, `scripts/kill-switch.sh` or `docs/human-log.md`; a person on the `HARNESS_AUTHORS` list may, with a code owner's review). | No |
+| 5 | Reviewer (Opus) | Starts when `ci` is green. A separate workflow, fresh context, `factory-reviewer` app. Reads only the ticket and the diff (as text from the API; the PR's code is never checked out). Checks the acceptance criteria and `CLAUDE.md`. Approves or requests changes with a comment. Writes its audit record. | No |
 | 6 | GitHub | Auto-merge fires when `ci` is green and the approval is in. | No |
 | 7 | Deploy | Builds the image, waits in the `production` environment. | No, it waits |
 | 8 | Diana | Reads the ticket, the audit comments and the diff. Clicks approve. | **Human decision 1: deploy to production.** Logged. |
@@ -98,7 +98,8 @@ Other human decisions, for completeness: "delete my account" will be a ticket wh
 
 ## Gotchas we already know
 - A PR opened with the default `GITHUB_TOKEN` does not trigger other workflows. The writer opens PRs with its app token.
-- Never use `pull_request_target` with code from the PR. Agent jobs never run on PRs from forks.
+- Never use `pull_request_target` with code from the PR. Agent jobs never run on PRs from forks. The reviewer uses `workflow_run` (it runs from `main`, after `ci`) and never checks out the PR.
+- The agent prompts live in `.github/agents/`. Vlad owns their text; they are protected paths like the workflows.
 - Dependabot PRs run workflows without repository secrets. The reviewer needs the Claude key as a Dependabot secret too, or dependency PRs wait for Diana's manual approval.
 - Run artifacts expire after 90 days; the ticket comments are the copy that lasts to the January demo.
 - Check the current docs of `anthropics/claude-code-action` before session 2 and pin it by SHA.

@@ -1,0 +1,78 @@
+# Deploy: after a merge to `main`, build the image, then wait for a named person (harness item 3).
+#
+#   build   proves that the image builds from the merged commit. No secrets.
+#   deploy  targets the environment `production`. GitHub holds the job until the required
+#           reviewer of that environment approves it. Only then does the job receive the
+#           Render deploy hook, the one secret of that environment, and call it.
+# No agent runs here. No agent job can read the deploy hook: it is not a repository secret.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    # Changes to documents and to the harness alone do not change the shop: no deploy, and no
+    # approval request, for those.
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - ".github/**"
+
+# No job gets any permission unless it asks for it below.
+permissions: {}
+
+# One deploy at a time. If several merges are waiting for approval, only the newest waits.
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build the image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read # check out the merged commit
+    outputs:
+      has_app: ${{ steps.app.outputs.has_app }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # do not leave the job token in .git/config
+      - name: Is there an app to deploy?
+        id: app
+        # Before session 4 there is no Dockerfile. Then nothing is built and nobody is asked
+        # to approve a deploy of nothing.
+        run: |
+          if [ -f Dockerfile ]; then
+            echo "has_app=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_app=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Dockerfile yet (session 4). Nothing to deploy."
+          fi
+      - name: Build the image
+        if: steps.app.outputs.has_app == 'true'
+        # The image is built to prove that it builds; it is not pushed anywhere. Render builds
+        # the same Dockerfile from the same commit (base image pinned by digest, dependencies
+        # from the lockfile).
+        run: docker build --pull --tag "shop:${GITHUB_SHA}" .
+
+  deploy:
+    name: deploy to production
+    needs: build
+    if: needs.build.outputs.has_app == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # The human gate. The job waits here until the required reviewer of `production` approves.
+    environment: production
+    permissions: {} # one HTTPS call to Render; nothing from GitHub is needed
+    steps:
+      - name: Ask Render to deploy this commit
+        env:
+          # Environment secret of `production`: available only to this job, only after approval.
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        # `ref` makes Render deploy exactly the approved commit, not whatever is newest.
+        # The response is discarded, so nothing about the hook is printed.
+        run: |
+          curl --fail --silent --show-error --max-time 30 --request POST --output /dev/null \
+            "${RENDER_DEPLOY_HOOK_URL}&ref=${GITHUB_SHA}"
+          echo "Render accepted the deploy of ${GITHUB_SHA}."

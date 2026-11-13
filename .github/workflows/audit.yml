@@ -1,0 +1,109 @@
+# Audit: one record per agent run (harness item 6).
+#
+# The planner, writer and reviewer workflows each call this as their last job, with
+# `if: always()`, so a failed or cancelled run is recorded too. The record goes to two places:
+#   1. a comment on the ticket (stays until the January demo);
+#   2. a JSON line uploaded as a run artifact (90 days).
+# No agent runs here and no agent secret is present: the workflow writes the record, not the agent.
+name: audit
+
+on:
+  workflow_call:
+    inputs:
+      agent: # planner, writer or reviewer
+        type: string
+        required: true
+      model: # the model id the run used
+        type: string
+        required: true
+      action: # what the run did, in a few words
+        type: string
+        required: true
+      ticket: # the ticket number (for the planner: the wish number)
+        type: string
+        required: true
+      also_comment_on: # more issue numbers that get the same record, separated by spaces
+        type: string
+        default: ""
+      pr_or_commit: # the PR number ("PR #12") or the commit SHA the run worked on
+        type: string
+        default: ""
+      result: # success, failure, cancelled or skipped: the result of the Claude job
+        type: string
+        required: true
+      turns:
+        type: string
+        default: ""
+      cost_usd:
+        type: string
+        default: ""
+      tokens_in:
+        type: string
+        default: ""
+      tokens_out:
+        type: string
+        default: ""
+
+# Nothing by default; the one job below asks for the one permission it needs.
+permissions: {}
+
+jobs:
+  record:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      # issues: write = post the record as a comment on the ticket. Nothing else: this job
+      # cannot read code, push, or touch pull requests. The artifact upload needs no permission.
+      issues: write
+    steps:
+      - name: Write the record
+        env:
+          # Inputs reach the script as environment variables, never pasted into the script
+          # text, so nothing in them can run as a command.
+          AGENT: ${{ inputs.agent }}
+          MODEL: ${{ inputs.model }}
+          ACTION: ${{ inputs.action }}
+          TICKET: ${{ inputs.ticket }}
+          ALSO: ${{ inputs.also_comment_on }}
+          PR_OR_COMMIT: ${{ inputs.pr_or_commit }}
+          RESULT: ${{ inputs.result }}
+          TURNS: ${{ inputs.turns }}
+          COST_USD: ${{ inputs.cost_usd }}
+          TOKENS_IN: ${{ inputs.tokens_in }}
+          TOKENS_OUT: ${{ inputs.tokens_out }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          jq -nc \
+            --arg agent "$AGENT" --arg model "$MODEL" --arg action "$ACTION" \
+            --arg ticket "$TICKET" --arg pr_or_commit "$PR_OR_COMMIT" \
+            --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg run_url "$RUN_URL" \
+            --arg result "$RESULT" --arg turns "$TURNS" --arg cost_usd "$COST_USD" \
+            --arg tokens_in "$TOKENS_IN" --arg tokens_out "$TOKENS_OUT" \
+            '{agent: $agent, model: $model, action: $action, pr_or_commit: $pr_or_commit,
+              time: $time, ticket: $ticket, run_url: $run_url, result: $result,
+              turns: $turns, cost_usd: $cost_usd, tokens_in: $tokens_in, tokens_out: $tokens_out}' \
+            > audit.jsonl
+
+          {
+            printf '**Audit record: %s**\n\n```json\n' "$AGENT"
+            jq . audit.jsonl
+            printf '```\n'
+          } > comment.md
+
+          # Only plain issue numbers are accepted, whatever the caller sent.
+          for n in $TICKET $ALSO; do
+            if [[ "$n" =~ ^[0-9]+$ ]]; then
+              gh issue comment "$n" --body-file comment.md
+            fi
+          done
+
+      - name: Keep the record as a run artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: audit-${{ inputs.agent }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: audit.jsonl
+          retention-days: 90
+          if-no-files-found: error

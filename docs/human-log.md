@@ -13,3 +13,4 @@ building the harness, or **product owner wish** for a wish. Agents never write h
 | 2026-11-13 | Diana | Opened the session 1 PR (plan, factory threat model, agent rules, issue forms, this log). | setup |
 | 2026-11-13 21:22 | Diana | Invited `pseudocod` (Vlad) as collaborator with Write access, not Admin. | setup |
 | 2026-11-13 22:36 | Diana | Reviewed and merged PR #1 (session 1 documents) into `main`. | setup |
+| 2026-11-13 23:10 | Diana | Session 2: opened the PR with the agent workflows (planner, writer, ci, reviewer, deploy, audit) and first drafts of the agent prompts, written with Claude Code (Fable 5.2). | setup |
