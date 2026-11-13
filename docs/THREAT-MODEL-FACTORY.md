@@ -6,7 +6,7 @@ Written 13 Nov 2026 by Diana; reviewed by Vlad. Update it when a control changes
 ## What we protect
 - **The main branch and production.** Only reviewed, tested code reaches users, and only after a person approves.
 - **Secrets.** The Claude API key, three GitHub App private keys, the Render deploy hook, the Neon connection string, the Stripe test key.
-- **Money.** Prepaid credits on the factory's key, capped at 20 USD a month.
+- **Money.** Prepaid credits on the factory's key, capped at 35 USD a month.
 - **The record.** The audit log and the human log must be true.
 
 ## Who can reach the factory
@@ -42,8 +42,8 @@ Severity: how bad if it happens. Controls are in the order they act.
 
 ### T4. Runaway cost
 - **Who:** a loop between agents (writer fails, reviewer requests changes, writer retries), a hidden instruction, a bug in a trigger that starts the agent on every event.
-- **How bad: medium.** Prepaid credits are the ceiling, so the loss is bounded at 20 USD, but the factory stops for the month.
-- **Controls:** Console spend limit 20 USD with an alert at 10 USD; `--max-turns` per run; one writer run per ticket per event, never on its own comments; a concurrency group per ticket so two runs never overlap; on a billing error the job saves the branch, labels the ticket `paused-no-credits` and notifies Diana; topping up is a logged human decision; the kill switch.
+- **How bad: medium.** Prepaid credits are the ceiling, so the loss is bounded at 35 USD, but the factory stops for the month.
+- **Controls:** Console spend limit 35 USD with an alert at 20 USD; `--max-turns` per run; one writer run per ticket per event, never on its own comments; a concurrency group per ticket so two runs never overlap; on a billing error the job saves the branch, labels the ticket `paused-no-credits` and notifies Diana; topping up is a logged human decision; the kill switch.
 - **Residual:** the cap hits during a real ticket. It resumes after a top-up; the pause is itself a good demo.
 
 ### T5. A malicious or vulnerable dependency
