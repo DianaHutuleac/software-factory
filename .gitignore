@@ -1,0 +1,7 @@
+# private notes and course handouts: never pushed
+private/
+# secrets
+.env
+.env.*
+# macOS
+.DS_Store
