@@ -94,7 +94,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update --quiet
-          sudo apt-get install --yes --no-install-recommends bubblewrap
+          # socat: the sandbox needs it as well; without it no command can start.
+          sudo apt-get install --yes --no-install-recommends bubblewrap socat
           if ! bwrap --ro-bind / / true; then
             sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
             bwrap --ro-bind / / true
@@ -114,8 +115,10 @@ jobs:
           # --permission-mode acceptEdits: file edits inside the checkout are allowed; any
           #   command that is not read-only and not in --allowedTools is refused, because
           #   nobody is there to approve it.
-          # --allowedTools: STACK (session 4): add this line with the exact test command and
-          #   nothing wider, for example  --allowedTools "Bash(npm test)"
+          # --allowedTools: the file tools, named one by one. In the first run acceptEdits
+          #   alone did not let the writer edit a file.
+          #   STACK (session 4): add the exact test command to this list and nothing wider,
+          #   for example  --allowedTools "Read,Glob,Grep,Edit,Write,Bash(npm test)"
           # --disallowedTools: no web access and no MCP servers.
           # --json-schema: the answer must be this JSON object, or the step fails.
           claude_args: |
@@ -123,6 +126,7 @@ jobs:
             --max-turns 50
             --max-budget-usd 5
             --permission-mode acceptEdits
+            --allowedTools "Read,Glob,Grep,Edit,Write"
             --disallowedTools "WebFetch,WebSearch,mcp__*"
             --strict-mcp-config
             --json-schema '{"type":"object","additionalProperties":false,"required":["status","summary","pr_body"],"properties":{"status":{"type":"string","enum":["done","needs_human"]},"summary":{"type":"string"},"pr_body":{"type":"string"}}}'
