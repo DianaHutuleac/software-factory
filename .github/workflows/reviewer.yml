@@ -1,0 +1,253 @@
+# Reviewer: a second agent, with a fresh context and a different model, reads the ticket and
+# the diff and approves or requests changes.
+#
+# It starts when `ci` finishes on a pull request, so:
+#   - Opus is only paid for on pull requests that are already green;
+#   - this file always runs as it is on `main`: a pull request cannot change its own reviewer;
+#   - the pull request's code is never checked out or run here. The diff is fetched from the
+#     GitHub API and handled as text. (That is what makes `workflow_run` safe to use; this
+#     repository never uses `pull_request_target`.)
+#
+# Two jobs, on purpose:
+#   review  runs Claude with no tools. It sees the ticket and the diff, and returns a JSON verdict.
+#   post    has no Claude in it. It posts that verdict as a review with the reviewer app's
+#           token: a different identity from the pull request's author, the writer app.
+name: reviewer
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+
+# No job gets any permission unless it asks for it below.
+permissions: {}
+
+# One review at a time per branch; a newer `ci` run replaces a review that has not started.
+concurrency:
+  group: reviewer-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+env:
+  MODEL: claude-opus-5-5 # a different model from the writer (Sonnet)
+
+jobs:
+  review:
+    name: review (Claude, no hands)
+    # First filter, before anything is spent: `ci` passed, on a pull request, from a branch in
+    # this repository (never a fork), named like a writer branch. The first step then checks
+    # the pull request itself, because a branch name alone proves nothing.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      startsWith(github.event.workflow_run.head_branch, 'ticket-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # This environment holds one secret, ANTHROPIC_API_KEY, and only runs from `main` may use
+    # it. The GitHub App keys live in another environment that this job cannot read.
+    environment: factory-think
+    permissions:
+      contents: read # check out `main` to read the reviewer prompt and CLAUDE.md
+      pull-requests: read # read the pull request and its diff from the API
+      issues: read # read the ticket
+      # No write permission of any kind: this job cannot approve, comment, label or push.
+    outputs:
+      go: ${{ steps.check.outputs.go }}
+      pr: ${{ steps.check.outputs.pr }}
+      ticket: ${{ steps.check.outputs.ticket }}
+      verdict: ${{ steps.result.outputs.verdict }}
+      model: ${{ env.MODEL }}
+      turns: ${{ steps.result.outputs.turns }}
+      cost_usd: ${{ steps.result.outputs.cost_usd }}
+      tokens_in: ${{ steps.result.outputs.tokens_in }}
+      tokens_out: ${{ steps.result.outputs.tokens_out }}
+    steps:
+      - name: Check that this is a writer pull request for a planner ticket
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.workflow_run.pull_requests[0].number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WRITER_BOT_LOGIN: ${{ vars.WRITER_BOT_LOGIN }}
+          PLANNER_BOT_LOGIN: ${{ vars.PLANNER_BOT_LOGIN }}
+        run: |
+          set -euo pipefail
+          stop() { echo "::notice::No review: $1"; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          # Unset variables must never match anything.
+          [ -n "${WRITER_BOT_LOGIN:-}" ] && [ -n "${PLANNER_BOT_LOGIN:-}" ] \
+            || stop "WRITER_BOT_LOGIN or PLANNER_BOT_LOGIN is not set"
+          [[ "${PR:-}" =~ ^[0-9]+$ ]] || stop "the ci run has no pull request in this repository"
+          mkdir -p "$RUNNER_TEMP/in"
+          gh api "repos/$GH_REPO/pulls/$PR" > "$RUNNER_TEMP/in/pr.json"
+
+          # The pull request is open, targets main, comes from this repository, was opened by
+          # the writer app, and its head is exactly the commit that `ci` just passed.
+          jq -e --arg repo "$GH_REPO" --arg sha "$HEAD_SHA" --arg writer "$WRITER_BOT_LOGIN" '
+            .state == "open" and .base.ref == "main"
+            and .head.repo.full_name == $repo
+            and .user.login == $writer
+            and .head.sha == $sha
+            and (.head.ref | test("^ticket-[0-9]+$"))
+          ' "$RUNNER_TEMP/in/pr.json" >/dev/null || stop "PR #$PR is not a current writer pull request"
+
+          # The ticket is a real ticket: an issue (not a pull request) opened by the planner app.
+          ticket=$(jq -r '.head.ref | sub("^ticket-"; "")' "$RUNNER_TEMP/in/pr.json")
+          gh api "repos/$GH_REPO/issues/$ticket" > "$RUNNER_TEMP/in/ticket.json"
+          jq -e --arg planner "$PLANNER_BOT_LOGIN" '
+            .user.login == $planner and (has("pull_request") | not)
+          ' "$RUNNER_TEMP/in/ticket.json" >/dev/null || stop "#$ticket is not a planner ticket"
+
+          # The diff, as text. This is the only form in which the pull request's code gets here.
+          gh api "repos/$GH_REPO/pulls/$PR" -H "Accept: application/vnd.github.diff" > "$RUNNER_TEMP/in/pr.diff"
+
+          {
+            echo "go=true"
+            echo "pr=$PR"
+            echo "ticket=$ticket"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out main (never the pull request)
+        if: steps.check.outputs.go == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No `ref`: for workflow_run this is the default branch. The reviewer prompt and
+          # CLAUDE.md therefore come from main, not from the change under review.
+          persist-credentials: false # do not leave the job token in .git/config
+
+      - name: Build the prompt (the ticket and the diff go in as data)
+        if: steps.check.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          # Each block is wrapped in tags that carry a random id, which the text inside cannot
+          # guess, so it cannot close the tag early and continue as "instructions".
+          id=$(openssl rand -hex 8)
+          {
+            cat .github/agents/reviewer.md
+            printf '\n<ticket id="%s">\n' "$id"
+            jq -r '.title + "\n\n" + (.body // "")' "$RUNNER_TEMP/in/ticket.json"
+            printf '</ticket id="%s">\n\n<diff id="%s">\n' "$id" "$id"
+            cat "$RUNNER_TEMP/in/pr.diff"
+            printf '\n</diff id="%s">\n' "$id"
+          } > "$RUNNER_TEMP/prompt.txt"
+
+      - name: Run Claude
+        id: claude
+        if: steps.check.outputs.go == 'true'
+        # The base action of anthropics/claude-code-action: it runs Claude Code and nothing
+        # else. It puts no GitHub token in Claude's environment.
+        uses: anthropics/claude-code-action/base-action@f3b070c88125d33dbae5653df5f143101d4ea9dc # v1.0.276
+        with:
+          prompt_file: ${{ runner.temp }}/prompt.txt
+          # The only step in this workflow that sees the Claude key.
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # --max-turns / --max-budget-usd: the run stops at 5 turns or about 3 USD.
+          # --tools "": no tools at all, so the reviewer reads the ticket and the diff, and
+          #   nothing else. --disallowedTools / --strict-mcp-config: no MCP servers.
+          # --json-schema: the answer must be this JSON object, or the step fails.
+          claude_args: |
+            --model ${{ env.MODEL }}
+            --max-turns 5
+            --max-budget-usd 3
+            --permission-mode default
+            --disallowedTools "mcp__*"
+            --strict-mcp-config
+            --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","summary","findings"],"properties":{"verdict":{"type":"string","enum":["approve","request_changes"]},"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"string"}}}}'
+            --tools ""
+
+      - name: Hand the verdict and the usage numbers to the next jobs
+        id: result
+        if: always() && steps.check.outputs.go == 'true'
+        env:
+          STRUCTURED: ${{ steps.claude.outputs.structured_output }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          # Empty when Claude failed or returned something that is not JSON.
+          echo "verdict=$(jq -c . <<<"${STRUCTURED:-}" 2>/dev/null || true)" >> "$GITHUB_OUTPUT"
+          # Turns, cost and tokens for the audit record, from the action's execution log.
+          if [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
+            jq -r '([.[] | select(.type == "result")] | last // {})
+              | "turns=\(.num_turns // "")", "cost_usd=\(.total_cost_usd // "")",
+                "tokens_in=\(.usage.input_tokens // "")", "tokens_out=\(.usage.output_tokens // "")"' \
+              "$EXECUTION_FILE" >> "$GITHUB_OUTPUT" || true
+          fi
+
+  post:
+    name: post the review (reviewer app, no Claude)
+    needs: review
+    # Runs whenever a review was due, also when the review job failed, so the pull request
+    # never stays silent.
+    if: ${{ !cancelled() && needs.review.outputs.go == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # This environment holds the three GitHub App private keys; only runs from `main` may use it.
+    environment: factory-act
+    # The job token gets nothing. The review is posted as the reviewer app.
+    permissions: {}
+    outputs:
+      action: ${{ steps.post.outputs.action }}
+    steps:
+      - name: Get a token for the reviewer app
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.REVIEWER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REVIEWER_APP_PRIVATE_KEY }}
+          # The token is cut down to pull-requests: write on this repository (submit a review),
+          # valid for one hour, and revoked when the job ends. It cannot push or merge.
+          permission-pull-requests: write
+
+      - name: Approve or request changes
+        id: post
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ needs.review.outputs.pr }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          VERDICT: ${{ needs.review.outputs.verdict }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Only the two exact words lead to a review. Anything else, including no answer,
+          # approves nothing.
+          case "$(jq -r '.verdict // empty' <<<"${VERDICT:-null}" 2>/dev/null || true)" in
+            approve) event=APPROVE ;;
+            request_changes) event=REQUEST_CHANGES ;;
+            *)
+              gh pr comment "$PR" --body "The reviewer did not return a verdict. Nothing was approved. Run: $RUN_URL"
+              echo "action=reviewer returned no verdict on PR #$PR" >> "$GITHUB_OUTPUT"
+              exit 1
+              ;;
+          esac
+          # The review is tied to the commit that `ci` passed. If a newer commit arrives, the
+          # ruleset dismisses this approval.
+          jq -n --arg event "$event" --arg sha "$HEAD_SHA" --argjson v "$VERDICT" '
+            {event: $event, commit_id: $sha,
+             body: ($v.summary + (if ($v.findings | length) > 0
+                    then "\n\n" + ($v.findings | map("- " + .) | join("\n")) else "" end))}
+          ' | gh api --method POST "repos/$GH_REPO/pulls/$PR/reviews" --input - >/dev/null
+          if [ "$event" = "APPROVE" ]; then
+            echo "action=approved PR #$PR" >> "$GITHUB_OUTPUT"
+          else
+            echo "action=requested changes on PR #$PR" >> "$GITHUB_OUTPUT"
+          fi
+
+  audit:
+    needs: [review, post]
+    # always(): the record is written when a job failed or was cancelled too.
+    if: ${{ always() && needs.review.outputs.go == 'true' }}
+    permissions:
+      issues: write # the audit job comments the record on the ticket
+    uses: ./.github/workflows/audit.yml
+    with:
+      agent: reviewer
+      model: ${{ needs.review.outputs.model }}
+      action: ${{ needs.post.outputs.action || 'reviewer run did not finish' }}
+      ticket: ${{ needs.review.outputs.ticket }}
+      pr_or_commit: "PR #${{ needs.review.outputs.pr }} at ${{ github.event.workflow_run.head_sha }}"
+      result: ${{ needs.review.result }}
+      turns: ${{ needs.review.outputs.turns }}
+      cost_usd: ${{ needs.review.outputs.cost_usd }}
+      tokens_in: ${{ needs.review.outputs.tokens_in }}
+      tokens_out: ${{ needs.review.outputs.tokens_out }}

@@ -1,0 +1,284 @@
+# Writer: a ticket from the planner becomes a pull request. Door 2 of 2 that start an agent.
+#
+# Two jobs, on purpose:
+#   write    runs Claude in a checkout of `main`. It can edit files and run the tests. It has
+#            no GitHub write access and one secret (the Claude key). Its output is a patch file
+#            and a JSON object.
+#   publish  has no Claude in it. On a fresh machine it applies the patch, refuses it if it
+#            touches a protected path, pushes the branch `ticket-<n>` and opens the pull
+#            request with the writer app's token, so that `ci` and the reviewer run on it.
+# The app key and the code the agent ran are never on the same machine.
+name: writer
+
+on:
+  issues:
+    types: [opened] # only a new issue; comments, edits and labels start nothing
+
+# No job gets any permission unless it asks for it below.
+permissions: {}
+
+# Never two writer runs for the same ticket.
+concurrency:
+  group: writer-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+env:
+  MODEL: claude-sonnet-5-5
+  # Paths no agent may change. The same list is in ci.yml.
+  PROTECTED: '^\.github/|^\.claude/|^\.mcp\.json$|(^|/)CLAUDE(\.local)?\.md$|^CODEOWNERS$|^scripts/kill-switch\.sh$|^docs/human-log\.md$'
+
+jobs:
+  write:
+    name: write (Claude, no hands)
+    # The door: the issue carries the label `ticket` AND its author is the planner's GitHub
+    # App (repository variable PLANNER_BOT_LOGIN, for example "factory-planner[bot]"). A login
+    # ending in [bot] can only belong to that app. Tickets typed by people never match. An
+    # unset variable matches nobody.
+    if: >-
+      contains(github.event.issue.labels.*.name, 'ticket') &&
+      github.event.issue.user.login == vars.PLANNER_BOT_LOGIN
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # This environment holds one secret, ANTHROPIC_API_KEY, and only runs from `main` may use
+    # it. The GitHub App keys live in another environment that this job cannot read.
+    environment: factory-think
+    permissions:
+      # contents: read = check out `main`. Nothing else: this job cannot push, open a pull
+      # request, comment or label, with any token it can reach.
+      contents: read
+    env:
+      # Claude Code removes the Claude key and GitHub tokens from the environment of the
+      # commands it runs (the tests), so a test cannot simply read them.
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+    outputs:
+      result: ${{ steps.result.outputs.result }}
+      model: ${{ env.MODEL }}
+      turns: ${{ steps.result.outputs.turns }}
+      cost_usd: ${{ steps.result.outputs.cost_usd }}
+      tokens_in: ${{ steps.result.outputs.tokens_in }}
+      tokens_out: ${{ steps.result.outputs.tokens_out }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # do not leave the job token in .git/config
+
+      # STACK (session 4): add the toolchain setup (action pinned by SHA, exact version) and
+      # the frozen-lockfile install here, the same commands as in ci.yml.
+
+      - name: Build the prompt (the ticket goes in as data)
+        env:
+          # The ticket reaches the script through the environment, never pasted into the
+          # script text, so nothing in it can run as a command.
+          TICKET: ${{ github.event.issue.number }}
+          TICKET_TITLE: ${{ github.event.issue.title }}
+          TICKET_BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          # The ticket is wrapped in tags that carry a random id. The ticket cannot close the
+          # tag early and continue as "instructions", because it cannot guess the id.
+          id=$(openssl rand -hex 8)
+          {
+            cat .github/agents/writer.md
+            printf '\n<ticket id="%s" number="%s">\n%s\n\n%s\n</ticket id="%s">\n' \
+              "$id" "$TICKET" "$TICKET_TITLE" "$TICKET_BODY" "$id"
+          } > "$RUNNER_TEMP/prompt.txt"
+
+      - name: Run Claude
+        id: claude
+        # The base action of anthropics/claude-code-action: it runs Claude Code and nothing
+        # else. It puts no GitHub token in Claude's environment.
+        uses: anthropics/claude-code-action/base-action@f3b070c88125d33dbae5653df5f143101d4ea9dc # v1.0.276
+        with:
+          prompt_file: ${{ runner.temp }}/prompt.txt
+          # The only step in this workflow that sees the Claude key.
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # --max-turns / --max-budget-usd: the run stops at 50 turns or about 5 USD.
+          # --permission-mode acceptEdits: file edits inside the checkout are allowed; any
+          #   command that is not read-only and not in --allowedTools is refused, because
+          #   nobody is there to approve it.
+          # --allowedTools: STACK (session 4): add this line with the exact test command and
+          #   nothing wider, for example  --allowedTools "Bash(npm test)"
+          # --disallowedTools: no web access and no MCP servers.
+          # --json-schema: the answer must be this JSON object, or the step fails.
+          claude_args: |
+            --model ${{ env.MODEL }}
+            --max-turns 50
+            --max-budget-usd 5
+            --permission-mode acceptEdits
+            --disallowedTools "WebFetch,WebSearch,mcp__*"
+            --strict-mcp-config
+            --json-schema '{"type":"object","additionalProperties":false,"required":["status","summary","pr_body"],"properties":{"status":{"type":"string","enum":["done","needs_human"]},"summary":{"type":"string"},"pr_body":{"type":"string"}}}'
+
+      - name: Collect the changes as a patch
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          # Everything the agent changed, as one diff against the commit it started from.
+          git add -A
+          git diff --cached --binary "$GITHUB_SHA" > "$RUNNER_TEMP/out/writer.patch"
+          git diff --cached --stat "$GITHUB_SHA" | tail -n 1
+
+      - name: Upload the patch for the publish job
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: writer-patch
+          path: ${{ runner.temp }}/out/writer.patch
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Hand the result and the usage numbers to the next jobs
+        id: result
+        if: always()
+        env:
+          STRUCTURED: ${{ steps.claude.outputs.structured_output }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          # Empty when Claude failed or returned something that is not JSON.
+          echo "result=$(jq -c . <<<"${STRUCTURED:-}" 2>/dev/null || true)" >> "$GITHUB_OUTPUT"
+          # Turns, cost and tokens for the audit record, from the action's execution log.
+          if [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
+            jq -r '([.[] | select(.type == "result")] | last // {})
+              | "turns=\(.num_turns // "")", "cost_usd=\(.total_cost_usd // "")",
+                "tokens_in=\(.usage.input_tokens // "")", "tokens_out=\(.usage.output_tokens // "")"' \
+              "$EXECUTION_FILE" >> "$GITHUB_OUTPUT" || true
+          fi
+
+  publish:
+    name: publish (writer app, no Claude)
+    needs: write
+    # Runs whenever the write job ran, also when it failed, so the ticket never stays silent.
+    if: ${{ !cancelled() && needs.write.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # This environment holds the three GitHub App private keys; only runs from `main` may use it.
+    environment: factory-act
+    # The job token gets nothing. Everything here is done as the writer app. A pull request
+    # opened with the job token would not start `ci`; one opened by the app does.
+    permissions: {}
+    outputs:
+      pr: ${{ steps.publish.outputs.pr }}
+      action: ${{ steps.publish.outputs.action }}
+    steps:
+      - name: Get a token for the writer app
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.WRITER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.WRITER_APP_PRIVATE_KEY }}
+          # The token is cut down to these three, on this repository, valid for one hour, and
+          # revoked when the job ends.
+          permission-contents: write # push the branch ticket-<n> (the ruleset still blocks main)
+          permission-pull-requests: write # open the pull request
+          permission-issues: write # comment on the ticket and add `needs-human`
+          # Not requested, and not granted to the app: `workflows`. GitHub therefore rejects
+          # any push from this token that changes a file under .github/workflows/.
+
+      - name: Check out main at the commit the writer started from
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          token: ${{ steps.app.outputs.token }} # the push below is made as the writer app
+
+      - name: Download the patch
+        # If the write job died before it uploaded a patch, carry on: the next step sees that
+        # there is no result and asks for a human on the ticket.
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: writer-patch
+          path: ${{ runner.temp }}/in
+
+      - name: Open the pull request, or ask for a human
+        id: publish
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          TICKET: ${{ github.event.issue.number }}
+          TICKET_TITLE: ${{ github.event.issue.title }}
+          RESULT: ${{ needs.write.outputs.result }}
+          PATCH: ${{ runner.temp }}/in/writer.patch
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Repository variable. Set it to "true" only after the ruleset on `main` exists:
+          # without required checks, auto-merge would merge at once.
+          AUTO_MERGE: ${{ vars.AUTO_MERGE }}
+        run: |
+          set -euo pipefail
+
+          # Label the ticket, say why, record it for the audit, and stop.
+          needs_human() { # $1 = comment for the ticket, $2 = action for the audit record
+            printf '%s\n\nRun: %s\n' "$1" "$RUN_URL" > "$RUNNER_TEMP/comment.md"
+            gh issue edit "$TICKET" --add-label needs-human
+            gh issue comment "$TICKET" --body-file "$RUNNER_TEMP/comment.md"
+            echo "action=$2; ticket labelled needs-human" >> "$GITHUB_OUTPUT"
+            exit 1
+          }
+
+          if ! jq -e 'type == "object"' <<<"${RESULT:-null}" >/dev/null 2>&1; then
+            needs_human "The writer did not finish (an error, the turn limit or the budget limit)." \
+              "writer did not finish"
+          fi
+          if [ "$(jq -r '.status' <<<"$RESULT")" != "done" ]; then
+            needs_human "The writer stopped and asks for a human: $(jq -r '.summary' <<<"$RESULT")" \
+              "writer stopped and asked for a human"
+          fi
+          if [ ! -s "$PATCH" ]; then
+            needs_human "The writer reported done but changed no files." "writer changed no files"
+          fi
+
+          # Apply the patch to the index. Nothing from the patch is run in this job.
+          git apply --index "$PATCH"
+
+          # Refuse a change to a protected path before anything is pushed.
+          touched=$(git diff --cached --name-only --no-renames | grep -E "$PROTECTED" || true)
+          if [ -n "$touched" ]; then
+            needs_human "The writer's change touches protected paths and was not pushed: $(tr '\n' ' ' <<<"$touched")" \
+              "refused a change to protected paths"
+          fi
+
+          # One commit, authored by the writer app, with the ticket number in the message.
+          title=$(printf '%s' "$TICKET_TITLE" | tr '\r\n' '  ' | sed 's/^Ticket: *//')
+          bot_id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
+          git -c user.name="${APP_SLUG}[bot]" \
+              -c user.email="${bot_id}+${APP_SLUG}[bot]@users.noreply.github.com" \
+              commit --quiet --no-verify -m "#${TICKET} ${title}"
+          # A plain push to a new branch: it fails if ticket-<n> already exists, and can never
+          # be a force push.
+          git push origin "HEAD:refs/heads/ticket-${TICKET}"
+
+          # The pull request: title starts with the ticket number, body is the writer's report,
+          # and "Closes" links it to the ticket.
+          {
+            jq -r '.pr_body' <<<"$RESULT"
+            printf '\n\nCloses #%s\n' "$TICKET"
+          } > "$RUNNER_TEMP/pr.md"
+          url=$(gh pr create --base main --head "ticket-${TICKET}" \
+            --title "#${TICKET} ${title}" --body-file "$RUNNER_TEMP/pr.md")
+          echo "pr=PR #${url##*/}" >> "$GITHUB_OUTPUT"
+          echo "action=opened PR #${url##*/} from branch ticket-${TICKET}" >> "$GITHUB_OUTPUT"
+
+          # GitHub merges by itself once `ci` is green and the reviewer has approved.
+          if [ "$AUTO_MERGE" = "true" ]; then
+            gh pr merge --auto --squash "$url"
+          fi
+
+  audit:
+    needs: [write, publish]
+    # always(): the record is written when a job failed or was cancelled too.
+    if: ${{ always() && needs.write.result != 'skipped' }}
+    permissions:
+      issues: write # the audit job comments the record on the ticket
+    uses: ./.github/workflows/audit.yml
+    with:
+      agent: writer
+      model: ${{ needs.write.outputs.model }}
+      action: ${{ needs.publish.outputs.action || 'writer run did not finish' }}
+      ticket: ${{ github.event.issue.number }}
+      pr_or_commit: ${{ needs.publish.outputs.pr || github.sha }}
+      result: ${{ needs.write.result }}
+      turns: ${{ needs.write.outputs.turns }}
+      cost_usd: ${{ needs.write.outputs.cost_usd }}
+      tokens_in: ${{ needs.write.outputs.tokens_in }}
+      tokens_out: ${{ needs.write.outputs.tokens_out }}

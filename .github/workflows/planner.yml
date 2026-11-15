@@ -1,0 +1,238 @@
+# Planner: a wish from the product owner becomes tickets. Door 1 of 2 that start an agent.
+#
+# Two jobs, on purpose:
+#   plan  runs Claude. It can read the wish and nothing else: no tools, no GitHub write access,
+#         one secret (the Claude key). Its only output is a JSON object.
+#   file  has no Claude in it. It takes that JSON and creates the issues with the planner
+#         app's token. A hijacked planner can therefore do one thing: propose up to 5 tickets.
+name: planner
+
+on:
+  issues:
+    types: [opened] # only a new issue; editing or labelling an old one starts nothing
+
+# No job gets any permission unless it asks for it below.
+permissions: {}
+
+# One planner run per wish, and never two at once for the same wish.
+concurrency:
+  group: planner-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+env:
+  MODEL: claude-sonnet-5-5
+
+jobs:
+  plan:
+    name: plan (Claude, no hands)
+    # The door: the issue carries the label `wish` (the Wish form adds it) AND its author is on
+    # the allow-list in the repository variable WISH_AUTHORS, a JSON array of logins such as
+    # ["product-owner"]. An unset variable means an empty list: nobody starts the planner.
+    if: >-
+      contains(github.event.issue.labels.*.name, 'wish') &&
+      contains(fromJSON(vars.WISH_AUTHORS || '[]'), github.event.issue.user.login)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # This environment holds one secret, ANTHROPIC_API_KEY, and only runs from `main` may use
+    # it. The GitHub App keys live in another environment that this job cannot read.
+    environment: factory-think
+    permissions:
+      # contents: read = check out `main` to read the planner prompt and CLAUDE.md.
+      # Nothing else. This job cannot create issues, comment, label or push.
+      contents: read
+    outputs:
+      plan: ${{ steps.result.outputs.plan }}
+      model: ${{ env.MODEL }}
+      turns: ${{ steps.result.outputs.turns }}
+      cost_usd: ${{ steps.result.outputs.cost_usd }}
+      tokens_in: ${{ steps.result.outputs.tokens_in }}
+      tokens_out: ${{ steps.result.outputs.tokens_out }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # do not leave the job token in .git/config
+
+      - name: Build the prompt (the wish goes in as data)
+        id: prompt
+        env:
+          # The wish reaches the script through the environment, never pasted into the script
+          # text, so nothing in it can run as a command.
+          WISH_TITLE: ${{ github.event.issue.title }}
+          WISH_BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          # Tripwire, before any tokens are spent: the Wish form never produces HTML comments
+          # or invisible characters. A wish that has them is hiding text from the person who
+          # reads the rendered issue. It is marked suspicious and Claude is not started.
+          if printf '%s\n%s' "$WISH_TITLE" "$WISH_BODY" | LC_ALL=C.UTF-8 grep -qP \
+            '<!--|[\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2060}-\x{2064}\x{FEFF}\x{E0000}-\x{E007F}]'; then
+            echo "hidden=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "hidden=false" >> "$GITHUB_OUTPUT"
+          # The wish is wrapped in tags that carry a random id. The wish cannot close the tag
+          # early and continue as "instructions", because it cannot guess the id.
+          id=$(openssl rand -hex 8)
+          {
+            cat .github/agents/planner.md
+            printf '\n<wish id="%s">\n%s\n\n%s\n</wish id="%s">\n' "$id" "$WISH_TITLE" "$WISH_BODY" "$id"
+          } > "$RUNNER_TEMP/prompt.txt"
+
+      - name: Run Claude
+        id: claude
+        if: steps.prompt.outputs.hidden == 'false'
+        # The base action of anthropics/claude-code-action: it runs Claude Code and nothing
+        # else. It puts no GitHub token in Claude's environment.
+        uses: anthropics/claude-code-action/base-action@f3b070c88125d33dbae5653df5f143101d4ea9dc # v1.0.276
+        with:
+          prompt_file: ${{ runner.temp }}/prompt.txt
+          # The only step in this workflow that sees the Claude key.
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # --max-turns / --max-budget-usd: the run stops at 5 turns or about 0.50 USD.
+          # --tools "": no tools at all. --disallowedTools / --strict-mcp-config: no MCP servers.
+          # --json-schema: the answer must be this JSON object, or the step fails.
+          claude_args: |
+            --model ${{ env.MODEL }}
+            --max-turns 5
+            --max-budget-usd 0.50
+            --permission-mode default
+            --disallowedTools "mcp__*"
+            --strict-mcp-config
+            --json-schema '{"type":"object","additionalProperties":false,"required":["suspicious","reason","tickets"],"properties":{"suspicious":{"type":"boolean"},"reason":{"type":"string"},"tickets":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["title","goal","acceptance_criteria","out_of_scope","personal_data","needs_threat_model","threat_model"],"properties":{"title":{"type":"string"},"goal":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"out_of_scope":{"type":"string"},"personal_data":{"type":"string"},"needs_threat_model":{"type":"boolean"},"threat_model":{"type":"string"}}}}}}'
+            --tools ""
+
+      - name: Hand the plan and the usage numbers to the next jobs
+        id: result
+        if: always()
+        env:
+          HIDDEN: ${{ steps.prompt.outputs.hidden }}
+          STRUCTURED: ${{ steps.claude.outputs.structured_output }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          if [ "$HIDDEN" = "true" ]; then
+            plan='{"suspicious":true,"reason":"The wish contains hidden text (an HTML comment or invisible characters). The planner was not started.","tickets":[]}'
+          else
+            # Empty when Claude failed or returned something that is not JSON.
+            plan=$(jq -c . <<<"${STRUCTURED:-}" 2>/dev/null || true)
+          fi
+          echo "plan=$plan" >> "$GITHUB_OUTPUT"
+          # Turns, cost and tokens for the audit record, from the action's execution log.
+          if [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
+            jq -r '([.[] | select(.type == "result")] | last // {})
+              | "turns=\(.num_turns // "")", "cost_usd=\(.total_cost_usd // "")",
+                "tokens_in=\(.usage.input_tokens // "")", "tokens_out=\(.usage.output_tokens // "")"' \
+              "$EXECUTION_FILE" >> "$GITHUB_OUTPUT" || true
+          fi
+
+  file:
+    name: file tickets (planner app, no Claude)
+    needs: plan
+    # Runs whenever the plan job ran, also when it failed, so the wish never stays silent.
+    if: ${{ !cancelled() && needs.plan.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # This environment holds the three GitHub App private keys; only runs from `main` may use it.
+    environment: factory-act
+    # The job token gets nothing. Everything here is done as the planner app, so the tickets'
+    # author is the planner bot: that author is what opens door 2 (the writer).
+    permissions: {}
+    outputs:
+      tickets: ${{ steps.file.outputs.tickets }}
+      action: ${{ steps.file.outputs.action }}
+    steps:
+      - name: Get a token for the planner app
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.PLANNER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PLANNER_APP_PRIVATE_KEY }}
+          # The token is cut down to issues: write on this repository, valid for one hour,
+          # and revoked when the job ends.
+          permission-issues: write
+
+      - name: Create the tickets, or mark the wish
+        id: file
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          WISH: ${{ github.event.issue.number }}
+          PLAN: ${{ needs.plan.outputs.plan }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # No usable plan: say so on the wish and ask for a human.
+          if ! jq -e 'type == "object"' <<<"${PLAN:-null}" >/dev/null 2>&1; then
+            gh issue edit "$WISH" --add-label needs-human
+            gh issue comment "$WISH" --body "The planner did not return a plan. Run: $RUN_URL"
+            echo "action=planner returned no plan; wish labelled needs-human" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          # A wish that tries to instruct the agents: label it and stop. No tickets.
+          if [ "$(jq -r '.suspicious' <<<"$PLAN")" = "true" ]; then
+            gh issue edit "$WISH" --add-label suspicious
+            jq -r '"Marked `suspicious`. No tickets were written.\n\nReason: " + .reason' <<<"$PLAN" \
+              | gh issue comment "$WISH" --body-file -
+            echo "action=wish labelled suspicious; no tickets" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # At most five tickets per wish, whatever the planner returned.
+          count=$(jq '.tickets | length' <<<"$PLAN")
+          if [ "$count" -gt 5 ]; then count=5; fi
+          if [ "$count" -eq 0 ]; then
+            gh issue edit "$WISH" --add-label needs-human
+            gh issue comment "$WISH" --body "The planner wrote no tickets for this wish. Run: $RUN_URL"
+            echo "action=planner wrote no tickets; wish labelled needs-human" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          created=""
+          for i in $(seq 0 $((count - 1))); do
+            ticket=$(jq -c ".tickets[$i]" <<<"$PLAN")
+            title=$(jq -r '"Ticket: " + (.title | gsub("[\\r\\n]+"; " "))' <<<"$ticket")
+            # Same sections, in the same order, as .github/ISSUE_TEMPLATE/ticket.yml.
+            jq -r --arg wish "#$WISH" '
+              "### Wish\n\n" + $wish
+              + "\n\n### Goal\n\n" + .goal
+              + "\n\n### Acceptance criteria\n\n" + (.acceptance_criteria | map("- " + .) | join("\n"))
+              + "\n\n### Out of scope\n\n" + .out_of_scope
+              + "\n\n### Personal data touched\n\n" + .personal_data
+              + "\n\n### Needs a threat model\n\n" + (if .needs_threat_model then "yes" else "no" end)
+              + "\n\n### Threat model (when yes)\n\n" + (if .needs_threat_model then .threat_model else "_No response_" end)
+            ' <<<"$ticket" > "$RUNNER_TEMP/ticket.md"
+            labels=ticket
+            if [ "$(jq -r '.needs_threat_model' <<<"$ticket")" = "true" ]; then
+              labels=ticket,needs-threat-model
+            fi
+            url=$(gh issue create --title "$title" --body-file "$RUNNER_TEMP/ticket.md" --label "$labels")
+            created="$created ${url##*/}"
+          done
+          created=${created# }
+
+          # Link the tickets back from the wish.
+          gh issue comment "$WISH" --body "Tickets written from this wish: #${created// /, #}"
+          echo "tickets=$created" >> "$GITHUB_OUTPUT"
+          echo "action=wrote tickets #${created// /, #} from wish #$WISH" >> "$GITHUB_OUTPUT"
+
+  audit:
+    needs: [plan, file]
+    # always(): the record is written when a job failed or was cancelled too.
+    if: ${{ always() && needs.plan.result != 'skipped' }}
+    permissions:
+      issues: write # the audit job comments the record on the wish and on each new ticket
+    uses: ./.github/workflows/audit.yml
+    with:
+      agent: planner
+      model: ${{ needs.plan.outputs.model }}
+      action: ${{ needs.file.outputs.action || 'planner run did not finish' }}
+      ticket: ${{ github.event.issue.number }}
+      also_comment_on: ${{ needs.file.outputs.tickets }}
+      pr_or_commit: ${{ github.sha }}
+      result: ${{ needs.plan.result }}
+      turns: ${{ needs.plan.outputs.turns }}
+      cost_usd: ${{ needs.plan.outputs.cost_usd }}
+      tokens_in: ${{ needs.plan.outputs.tokens_in }}
+      tokens_out: ${{ needs.plan.outputs.tokens_out }}
