@@ -84,6 +84,23 @@ jobs:
               "$id" "$TICKET" "$TICKET_TITLE" "$TICKET_BODY" "$id"
           } > "$RUNNER_TEMP/prompt.txt"
 
+      - name: Install the sandbox that hides the Claude key from the tests
+        # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB (above) needs bubblewrap, and Claude Code refuses to
+        # start without it. The runner image does not ship it. It comes from Ubuntu's own
+        # package archive for this runner image (ubuntu-24.04).
+        # Ubuntu 24.04 can forbid the user namespaces bubblewrap needs. If the self-test
+        # fails, that restriction is lifted for this one throwaway runner and the test is
+        # repeated; if it still fails, the job stops here, before Claude and before any cost.
+        run: |
+          set -euo pipefail
+          sudo apt-get update --quiet
+          sudo apt-get install --yes --no-install-recommends bubblewrap
+          if ! bwrap --ro-bind / / true; then
+            sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
+            bwrap --ro-bind / / true
+          fi
+          bwrap --version
+
       - name: Run Claude
         id: claude
         # The base action of anthropics/claude-code-action: it runs Claude Code and nothing
