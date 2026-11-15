@@ -143,8 +143,9 @@ jobs:
           # The only step in this workflow that sees the Claude key.
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           # --max-turns / --max-budget-usd: the run stops at 5 turns or about 3 USD.
-          # --tools "": no tools at all, so the reviewer reads the ticket and the diff, and
-          #   nothing else. --disallowedTools / --strict-mcp-config: no MCP servers.
+          # --tools= (an empty list): no tools at all, so the reviewer reads the ticket and the
+          #   diff, and nothing else. Written with "=" because the action drops an empty value
+          #   written as --tools "". --disallowedTools / --strict-mcp-config: no MCP servers.
           # --json-schema: the answer must be this JSON object, or the step fails.
           claude_args: |
             --model ${{ env.MODEL }}
@@ -154,7 +155,7 @@ jobs:
             --disallowedTools "mcp__*"
             --strict-mcp-config
             --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","summary","findings"],"properties":{"verdict":{"type":"string","enum":["approve","request_changes"]},"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"string"}}}}'
-            --tools ""
+            --tools=
 
       - name: Hand the verdict and the usage numbers to the next jobs
         id: result
