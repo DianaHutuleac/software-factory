@@ -14,3 +14,6 @@ building the harness, or **product owner wish** for a wish. Agents never write h
 | 2026-11-13 21:22 | Diana | Invited `pseudocod` (Vlad) as collaborator with Write access, not Admin. | setup |
 | 2026-11-13 22:36 | Diana | Reviewed and merged PR #1 (session 1 documents) into `main`. | setup |
 | 2026-11-13 23:10 | Diana | Session 2: opened the PR with the agent workflows (planner, writer, ci, reviewer, deploy, audit) and first drafts of the agent prompts, written with Claude Code (Fable 5.2). | setup |
+| 2026-11-15 20:21 | Diana | Merged PR #3 (session 2 workflows) into `main`. No second person reviewed it before the merge; Vlad reviews it after the fact. | setup |
+| 2026-11-15 | Diana | Added the factory's settings: three GitHub Apps (planner, writer, reviewer) installed on this repository only, the environments `factory-think`, `factory-act` and `production` (all `main` only; Diana approves `production`), the repository variables and the five labels (labels created with Claude Code). | setup |
+| 2026-11-15 21:50 | Diana | First test wish (#4): the planner failed before calling Claude. Opened a PR with the fix (`--tools=`), written with Claude Code (Fable 5.2). | setup |

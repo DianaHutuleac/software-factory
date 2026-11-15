@@ -90,7 +90,9 @@ jobs:
           # The only step in this workflow that sees the Claude key.
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           # --max-turns / --max-budget-usd: the run stops at 5 turns or about 0.50 USD.
-          # --tools "": no tools at all. --disallowedTools / --strict-mcp-config: no MCP servers.
+          # --tools= (an empty list): no tools at all. Written with "=" because the action
+          # drops an empty value written as --tools "".
+          # --disallowedTools / --strict-mcp-config: no MCP servers.
           # --json-schema: the answer must be this JSON object, or the step fails.
           claude_args: |
             --model ${{ env.MODEL }}
@@ -100,7 +102,7 @@ jobs:
             --disallowedTools "mcp__*"
             --strict-mcp-config
             --json-schema '{"type":"object","additionalProperties":false,"required":["suspicious","reason","tickets"],"properties":{"suspicious":{"type":"boolean"},"reason":{"type":"string"},"tickets":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["title","goal","acceptance_criteria","out_of_scope","personal_data","needs_threat_model","threat_model"],"properties":{"title":{"type":"string"},"goal":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"out_of_scope":{"type":"string"},"personal_data":{"type":"string"},"needs_threat_model":{"type":"boolean"},"threat_model":{"type":"string"}}}}}}'
-            --tools ""
+            --tools=
 
       - name: Hand the plan and the usage numbers to the next jobs
         id: result
