@@ -19,3 +19,7 @@ building the harness, or **product owner wish** for a wish. Agents never write h
 | 2026-11-15 21:50 | Diana | First test wish (#4): the planner failed before calling Claude. Opened a PR with the fix (`--tools=`), written with Claude Code (Fable 5.2). | setup |
 | 2026-11-15 22:05 | Diana | Second test wish (#6): the planner wrote ticket #7; the writer could not start (bubblewrap missing on the runner). Opened a PR with the fix, written with Claude Code (Fable 5.2). | setup |
 | 2026-11-15 22:20 | Diana | Third test wish (#9): the writer started but could not edit files or run commands, and asked for a human on ticket #10. Opened a PR with the fix, written with Claude Code (Fable 5.2). | setup |
+| 2026-11-16 16:12 | Diana | Session 3: created the ruleset `main` with Claude Code (Opus 5.5): pull request required, one approving review, a code owner's review, stale approvals dismissed, required check `ci` from GitHub Actions only, no force push, no deletion, no bypass (admins included). | setup |
+| 2026-11-16 16:12 | Diana | Tried a direct push of an empty commit to `main`. Refused with `GH013`: "Changes must be made through a pull request" and "Required status check ci is expected". Removed the commit locally. | setup |
+| 2026-11-16 | Diana | Checked the `production` environment from session 2: Diana is the required reviewer, deploys only from `main`. No change. | setup |
+| 2026-11-16 | Diana | Opened the session 3 PR: `CODEOWNERS` (Diana and Vlad own the harness paths) and these log rows, written with Claude Code (Opus 5.5). | setup |

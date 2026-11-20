@@ -1,0 +1,13 @@
+# Code owners. The ruleset on main requires an approving review from a code owner for any
+# pull request that changes these paths. Both people are listed, so neither approves their own
+# harness change: the other one does. Agents are never code owners.
+# The same paths are protected by the "protected paths" job in .github/workflows/ci.yml.
+
+/.github/           @DianaHutuleac @pseudocod
+/.claude/           @DianaHutuleac @pseudocod
+/.mcp.json          @DianaHutuleac @pseudocod
+CLAUDE.md           @DianaHutuleac @pseudocod
+CLAUDE.local.md     @DianaHutuleac @pseudocod
+/scripts/           @DianaHutuleac @pseudocod
+/CODEOWNERS         @DianaHutuleac @pseudocod
+/docs/human-log.md  @DianaHutuleac @pseudocod
